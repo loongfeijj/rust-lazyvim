@@ -1,11 +1,8 @@
 ##############################################################################
 # 基于 LazyVim 的 Rust 开发容器
 #
-# 构建（用 --build-arg 把 UID/GID 对齐宿主机用户，避免挂载后文件权限错乱）：
-#   docker build \
-#     --build-arg USER_UID=$(id -u) \
-#     --build-arg USER_GID=$(id -g) \
-#     -t rust-lazyvim .
+# 构建（镜像跟人无关，团队里所有人共用同一个镜像，build 一次就够了）：
+#   docker build -t rust-lazyvim .
 #
 # 运行（把当前目录挂进容器的 /workspace）：
 #   docker run -it --rm \
@@ -14,13 +11,19 @@
 #     -v rust-lazyvim-cargo-target:/workspace/target \
 #     rust-lazyvim
 #
+# 容器里的用户 UID/GID 会在启动时（entrypoint.sh）自动对齐 /workspace 挂载目录
+# 的属主——也就是你宿主机当前用户，不用关心用户名叫什么、不用为每个人重新 build。
+# 极少数场景需要手动指定的话，可以 -e LOCAL_UID=xxxx -e LOCAL_GID=xxxx 覆盖。
+#
 # 进容器后：
 #   nvim .        # 打开 LazyVim，第一次进入会自动收尾插件/解析器安装
 #   cargo build   # 正常用 cargo
+#   <leader>gg    # nvim 里打开 lazygit（<leader>gG 打开当前文件所在目录的 lazygit）
 ##############################################################################
-FROM ubuntu:26.04
+FROM debian:bookworm-slim
 
 ARG NVIM_VERSION=v0.12.5
+ARG LAZYGIT_VERSION=0.65.1
 ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -32,9 +35,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 #------------------------------------------------------------------------------
 # 系统依赖
-#   build-essential/pkg-config/libssl-dev : 编译大多数 crate 需要
-#   git/curl/unzip/xz-utils                : lazy.nvim、rustup、nvim 安装需要
-#   ripgrep/fd-find                        : fzf-lua（LazyVim 默认模糊搜索）依赖
+#   build-essential/pkg-config/libssl-dev  : 编译大多数纯 Rust / 链接系统 openssl 的 crate
+#   git/curl/unzip/xz-utils                 : lazy.nvim、rustup、nvim 安装需要
+#   ripgrep/fd-find                         : fzf-lua（LazyVim 默认模糊搜索）依赖
+#   cmake                                   : 依赖 CMake 构建的 *-sys crate（如 rocksdb）
+#   clang/libclang-dev                      : bindgen 生成 FFI 绑定需要 libclang
+#   protobuf-compiler                       : prost-build/tonic-build 编译 .proto 用
+#   perl                                    : openssl-sys 开 vendored feature 时需要
+# 用不到某个工具的话可以从下面这个列表里删掉对应行，缩小镜像体积
 #------------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -44,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         libclang-dev \
         protobuf-compiler \
+        perl \
         git \
         curl \
         unzip \
@@ -73,8 +82,6 @@ RUN curl -fsSL -o /tmp/nvim.tar.gz \
 # apt 源里没有这个包，直接从 GitHub Releases 拉最新的预编译二进制。
 #------------------------------------------------------------------------------
 RUN LAZYGIT_ARCH=$(uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/x86_64/') \
-    && LAZYGIT_VERSION=$(curl -fsSL "https://api.github.com/repos/jesseduffield/lazygit/releases/latest" \
-        | grep -Po '"tag_name": *"v\K[^"]*') \
     && curl -fsSL -o /tmp/lazygit.tar.gz \
         "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_${LAZYGIT_ARCH}.tar.gz" \
     && tar -C /tmp -xzf /tmp/lazygit.tar.gz lazygit \
@@ -82,11 +89,14 @@ RUN LAZYGIT_ARCH=$(uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/x86_64/') \
     && rm -f /tmp/lazygit /tmp/lazygit.tar.gz
 
 #------------------------------------------------------------------------------
-# 非 root 用户（默认 UID/GID 1000，可在 build 时用 --build-arg 覆盖）
+# 非 root 用户 —— 这里的 UID/GID 只是镜像里的默认值/占位符，
+# 真正生效的值由 entrypoint.sh 在容器启动时按挂载目录动态调整。
+# sudoers 规则用 "#UID" 匹配而不是用户名，UID 被 entrypoint 改掉之后依然有效
 #------------------------------------------------------------------------------
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
     && useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/bash ${USERNAME} \
-    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+    && echo "#${USER_UID} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME}
 
 USER ${USERNAME}
 ENV HOME=/home/${USERNAME} \
@@ -127,4 +137,15 @@ RUN nvim --headless "+Lazy! sync" +qa \
     && nvim --headless -c "TSUpdate" -c "qa" || true
 
 WORKDIR /workspace
+
+#------------------------------------------------------------------------------
+# entrypoint 需要以 root 启动，才能在容器启动时 usermod/groupmod 调整 UID/GID，
+# 调整完之后再用 runuser 降权到 dev 用户执行真正的命令（nvim/cargo/bash 都不会
+# 以 root 身份运行，只有 entrypoint 这一小段初始化逻辑是 root）
+#------------------------------------------------------------------------------
+USER root
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
