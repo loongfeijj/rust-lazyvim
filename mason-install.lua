@@ -1,28 +1,38 @@
--- 配合 Dockerfile 在构建阶段用 headless nvim 跑一次，
--- 把 mason 安装 codelldb（异步）的过程等完，再退出进程。
--- 用法：nvim --headless -c "luafile mason-install.lua"
-
--- mason.nvim 一般是懒加载的，强制先加载它
+-- 由 lazy-install.lua 执行；等待 Mason 安装完成，失败抛出异常，由调用方退出。
 require('lazy').load({ plugins = { 'mason.nvim' } })
-
 local registry = require('mason-registry')
-
-registry.refresh(function()
-  local ok, pkg = pcall(registry.get_package, registry, 'codelldb')
-  if not ok then
-    vim.notify('mason: 找不到 codelldb 包', vim.log.levels.WARN)
-    vim.cmd('qa')
-    return
-  end
-
-  if pkg:is_installed() then
-    vim.cmd('qa')
-    return
-  end
-
-  pkg:install():once('closed', function()
-    vim.schedule(function()
-      vim.cmd('qa')
-    end)
-  end)
+local failures = {}
+registry:on('package:install:failed', function(pkg, err)
+  failures[#failures + 1] = pkg.name .. ': ' .. tostring(err)
 end)
+
+local refreshed, refresh_ok = false, false
+registry.refresh(function(success)
+  refreshed, refresh_ok = true, success
+end)
+assert(vim.wait(600000, function() return refreshed end, 100), 'Mason registry 刷新超时')
+assert(refresh_ok, 'Mason registry 刷新失败')
+
+local required = { 'codelldb', 'taplo', 'lua-language-server' }
+vim.list_extend(required, LazyVim.opts('mason.nvim').ensure_installed or {})
+for _, name in ipairs(required) do
+  local pkg = registry.get_package(name)
+  -- LazyVim 可能已经启动了安装；复用进行中的任务，避免重复安装异常。
+  if not pkg:is_installed() and not pkg:is_installing() then
+    pkg:install()
+  end
+end
+
+local packages = registry.get_all_packages()
+assert(vim.wait(600000, function()
+  for _, pkg in ipairs(packages) do
+    if pkg:is_installing() then
+      return false
+    end
+  end
+  return true
+end, 100), 'Mason 工具安装超时')
+assert(#failures == 0, table.concat(failures, '\n'))
+for _, name in ipairs(required) do
+  assert(registry.get_package(name):is_installed(), 'Mason 工具未安装: ' .. name)
+end

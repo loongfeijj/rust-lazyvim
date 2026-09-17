@@ -16,11 +16,11 @@
 # 极少数场景需要手动指定的话，可以 -e LOCAL_UID=xxxx -e LOCAL_GID=xxxx 覆盖。
 #
 # 进容器后：
-#   nvim .        # 打开 LazyVim，第一次进入会自动收尾插件/解析器安装
+#   nvim .        # 打开 LazyVim，插件、调试工具和解析器已在构建时预装
 #   cargo build   # 正常用 cargo
 #   <leader>gg    # nvim 里打开 lazygit（<leader>gG 打开当前文件所在目录的 lazygit）
 ##############################################################################
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG NVIM_VERSION=v0.12.5
 ARG LAZYGIT_VERSION=0.65.1
@@ -59,6 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xz-utils \
         ripgrep \
         fd-find \
+        fzf \
         ca-certificates \
         locales \
         sudo \
@@ -99,7 +100,9 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
     && chmod 0440 /etc/sudoers.d/${USERNAME}
 
 USER ${USERNAME}
-ENV HOME=/home/${USERNAME} \
+# 将构建时的用户名保留到运行时，供 entrypoint 对齐同一个账号的 UID/GID。
+ENV USERNAME=${USERNAME} \
+    HOME=/home/${USERNAME} \
     PATH=/home/${USERNAME}/.cargo/bin:$PATH
 WORKDIR ${HOME}
 
@@ -110,6 +113,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile default \
     && rustup component add rust-analyzer rustfmt clippy
 
+# 在启动 LazyVim 前提供 CLI，避免 build/config 同时触发 Mason 的异步安装。
+RUN cargo install --locked tree-sitter-cli
+
 #------------------------------------------------------------------------------
 # LazyVim（官方 starter 模板）+ 开启 lang.rust / lang.toml extra
 # lang.rust 这个 extra 会自动带上 rustaceanvim、crates.nvim、
@@ -119,6 +125,7 @@ RUN git clone --depth 1 https://github.com/LazyVim/starter "${HOME}/.config/nvim
     && rm -rf "${HOME}/.config/nvim/.git" \
     && printf '%s\n' \
         '{' \
+        '  "version": 8,' \
         '  "extras": [' \
         '    "lazyvim.plugins.extras.lang.rust",' \
         '    "lazyvim.plugins.extras.lang.toml"' \
@@ -126,21 +133,20 @@ RUN git clone --depth 1 https://github.com/LazyVim/starter "${HOME}/.config/nvim
         '  "news": {}' \
         '}' > "${HOME}/.config/nvim/lazyvim.json"
 
-# 让 headless 安装 codelldb 时等它真正下载完才退出（Mason 默认是异步安装的）
+# headless 安装脚本等待任务完成，并在失败时返回非零退出码。
+COPY --chown=${USERNAME}:${USERNAME} lazy-install.lua /tmp/lazy-install.lua
 COPY --chown=${USERNAME}:${USERNAME} mason-install.lua /tmp/mason-install.lua
 
 #------------------------------------------------------------------------------
 # 构建期预装插件 + codelldb，容器一起来就是热的（都需要联网）
 #------------------------------------------------------------------------------
-RUN nvim --headless "+Lazy! sync" +qa \
-    && nvim --headless -c "luafile /tmp/mason-install.lua" \
-    && nvim --headless -c "TSUpdate" -c "qa" || true
+RUN nvim --headless --cmd "luafile /tmp/lazy-install.lua"
 
 WORKDIR /workspace
 
 #------------------------------------------------------------------------------
 # entrypoint 需要以 root 启动，才能在容器启动时 usermod/groupmod 调整 UID/GID，
-# 调整完之后再用 runuser 降权到 dev 用户执行真正的命令（nvim/cargo/bash 都不会
+# 调整完之后再用 runuser 降权到配置的用户执行真正的命令（nvim/cargo/bash 都不会
 # 以 root 身份运行，只有 entrypoint 这一小段初始化逻辑是 root）
 #------------------------------------------------------------------------------
 USER root
